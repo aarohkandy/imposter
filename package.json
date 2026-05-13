@@ -1,0 +1,9 @@
+{
+  "name": "imposter-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pass-the-phone imposter game for localhost play.",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
