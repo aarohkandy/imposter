@@ -37,27 +37,29 @@
 
   .section { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 10px; font-weight: 600; }
 
-  .players { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
-  .tag {
-    padding: 8px 6px 8px 14px;
-    background: #1a1a1a;
-    border: 1px solid #262626;
-    border-radius: 999px;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    gap: 2px;
+  .player-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
+  .player-item {
+    display: flex; align-items: center; gap: 10px;
+    background: #1a1a1a; border: 1px solid #262626; border-radius: 10px;
+    padding: 10px 14px; font-size: 15px;
+    touch-action: pan-y; user-select: none;
   }
-  .tag button {
-    background: transparent;
-    border: none;
-    padding: 4px 10px;
-    color: #666;
-    font-size: 18px;
-    line-height: 1;
-    border-radius: 999px;
+  .player-item.drag-over { border-color: #555; background: #222; }
+  .player-item.dragging { opacity: 0.3; }
+  .drag-handle { color: #444; font-size: 17px; cursor: grab; line-height: 1; flex-shrink: 0; padding: 2px 0; }
+  .drag-handle:active { cursor: grabbing; }
+  .player-name { flex: 1; font-size: 15px; }
+  .player-name-edit {
+    flex: 1; background: transparent; border: none;
+    border-bottom: 1px solid #444; color: #fff;
+    font-size: 15px; outline: none; font-family: inherit; padding: 2px 0; min-width: 0;
   }
-  .tag button:hover { color: #fff; }
+  .player-actions { display: flex; gap: 0; flex-shrink: 0; }
+  .icon-btn {
+    background: transparent; border: none; padding: 4px 8px;
+    color: #555; font-size: 15px; line-height: 1; cursor: pointer; border-radius: 6px;
+  }
+  .icon-btn:hover { color: #ccc; }
 
   .add { display: flex; gap: 8px; margin-bottom: 28px; }
   .add input {
@@ -231,8 +233,12 @@
 
   @media (prefers-color-scheme: light) {
     body { background: #fafaf7; color: #111; }
-    .tag { background: #f0eee8; border-color: #e0ddd4; }
-    .tag button { color: #888; }
+    .player-item { background: #f5f3ee; border-color: #e0ddd4; }
+    .player-item.drag-over { border-color: #bbb; background: #eee; }
+    .drag-handle { color: #ccc; }
+    .player-name-edit { border-bottom-color: #bbb; color: #111; }
+    .icon-btn { color: #999; }
+    .icon-btn:hover { color: #111; }
     .add input, .add button { background: #fff; border-color: #e0ddd4; color: #111; }
     .pill { border-color: #d8d4ca; color: #444; }
     .pill.on { background: #111; color: #fff; border-color: #111; }
@@ -280,11 +286,46 @@ const WORDS = {
 
 const CATS = Object.keys(WORDS);
 const state = {
-  players: ['om','aryan','rohan','thomas','roger','aaroh'],
+  players: [],
   selectedCats: new Set(CATS),
   word: null, category: null, imposterIdx: null,
-  phase: 'setup', turn: 0
+  phase: 'setup', turn: 0, editingIdx: null
 };
+
+// Touch drag state (single global instance — only one drag at a time)
+const _drag = { active: false, src: -1, over: -1, clone: null, listEl: null, offsetY: 0 };
+
+document.addEventListener('touchmove', e => {
+  if (!_drag.active) return;
+  e.preventDefault();
+  const t = e.touches[0];
+  if (_drag.clone) _drag.clone.style.top = (t.clientY - _drag.offsetY) + 'px';
+  if (_drag.clone) _drag.clone.style.visibility = 'hidden';
+  const under = document.elementFromPoint(t.clientX, t.clientY);
+  if (_drag.clone) _drag.clone.style.visibility = '';
+  if (_drag.listEl) _drag.listEl.querySelectorAll('.player-item').forEach(e => e.classList.remove('drag-over'));
+  const item = under && under.closest('.player-item');
+  if (item && _drag.listEl && _drag.listEl.contains(item)) {
+    const idx = +item.dataset.idx;
+    if (idx !== _drag.src) { item.classList.add('drag-over'); _drag.over = idx; }
+    else _drag.over = _drag.src;
+  }
+}, {passive: false});
+
+function endTouchDrag() {
+  if (!_drag.active) return;
+  if (_drag.clone) { _drag.clone.remove(); _drag.clone = null; }
+  if (_drag.listEl) _drag.listEl.querySelectorAll('.player-item').forEach(e => e.classList.remove('dragging', 'drag-over'));
+  const { src, over } = _drag;
+  Object.assign(_drag, { active: false, src: -1, over: -1, listEl: null });
+  if (over !== -1 && over !== src) {
+    const moved = state.players.splice(src, 1)[0];
+    state.players.splice(over, 0, moved);
+    render();
+  }
+}
+document.addEventListener('touchend', endTouchDrag);
+document.addEventListener('touchcancel', endTouchDrag);
 
 const root = document.getElementById('root');
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -330,19 +371,98 @@ function render() {
   window.scrollTo(0, 0);
 }
 
+function saveEdit(idx, val) {
+  const v = val.trim();
+  if (v && !state.players.some((p, i) => p === v && i !== idx)) state.players[idx] = v;
+  state.editingIdx = null;
+  render();
+}
+
+function makePlayerList() {
+  const list = el('div', {class: 'player-list'});
+  let deskSrc = -1;
+
+  state.players.forEach((p, i) => {
+    const item = el('div', {class: 'player-item'});
+    item.dataset.idx = i;
+    item.setAttribute('draggable', 'true');
+
+    const handle = el('span', {class: 'drag-handle'}, '⠿');
+
+    let nameEl;
+    if (state.editingIdx === i) {
+      const inp = el('input', {class: 'player-name-edit', type: 'text', maxlength: 20});
+      inp.value = p;
+      inp.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); saveEdit(i, inp.value); }
+        if (e.key === 'Escape') { state.editingIdx = null; render(); }
+      });
+      inp.addEventListener('blur', () => saveEdit(i, inp.value));
+      setTimeout(() => { inp.focus(); inp.select(); }, 0);
+      nameEl = inp;
+    } else {
+      nameEl = el('span', {class: 'player-name'}, p);
+    }
+
+    const actions = el('div', {class: 'player-actions'});
+    if (state.editingIdx !== i) {
+      actions.appendChild(el('button', {class: 'icon-btn', 'aria-label': 'Edit ' + p,
+        onclick: e => { e.stopPropagation(); state.editingIdx = i; render(); }}, '✎'));
+    }
+    actions.appendChild(el('button', {class: 'icon-btn', 'aria-label': 'Remove ' + p,
+      onclick: () => { state.players.splice(i, 1); state.editingIdx = null; render(); }}, '×'));
+
+    // Desktop drag
+    item.addEventListener('dragstart', e => {
+      deskSrc = i; e.dataTransfer.effectAllowed = 'move';
+      setTimeout(() => item.classList.add('dragging'), 0);
+    });
+    item.addEventListener('dragend', () => {
+      deskSrc = -1;
+      list.querySelectorAll('.player-item').forEach(el => el.classList.remove('dragging', 'drag-over'));
+    });
+    item.addEventListener('dragover', e => {
+      e.preventDefault();
+      if (deskSrc !== -1 && deskSrc !== i) item.classList.add('drag-over');
+    });
+    item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+    item.addEventListener('drop', e => {
+      e.preventDefault();
+      if (deskSrc !== -1 && deskSrc !== i) {
+        const moved = state.players.splice(deskSrc, 1)[0];
+        state.players.splice(i, 0, moved);
+        deskSrc = -1; render();
+      }
+    });
+
+    // Touch drag — only initiated from the handle
+    handle.addEventListener('touchstart', e => {
+      _drag.active = true; _drag.src = i; _drag.over = i; _drag.listEl = list;
+      const rect = item.getBoundingClientRect();
+      _drag.offsetY = e.touches[0].clientY - rect.top;
+      const clone = item.cloneNode(true);
+      clone.style.cssText = 'position:fixed;left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;z-index:9999;pointer-events:none;opacity:0.9;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,.6);';
+      document.body.appendChild(clone);
+      _drag.clone = clone;
+      item.classList.add('dragging');
+    }, {passive: true});
+
+    item.appendChild(handle);
+    item.appendChild(nameEl);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+
+  return list;
+}
+
 function renderSetup() {
   const wrap = el('div');
   wrap.appendChild(el('h1', {class: 'h'}, 'Imposter'));
   wrap.appendChild(el('p', {class: 'sub'}, 'One person is bluffing. Find them — or fool everyone.'));
 
   wrap.appendChild(el('div', {class: 'section'}, 'Players (' + state.players.length + ')'));
-  const playersDiv = el('div', {class: 'players'});
-  state.players.forEach((p, i) => {
-    const tag = el('div', {class: 'tag'}, p);
-    tag.appendChild(el('button', {'aria-label': 'Remove ' + p, onclick: () => { state.players.splice(i,1); render(); }}, '×'));
-    playersDiv.appendChild(tag);
-  });
-  wrap.appendChild(playersDiv);
+  wrap.appendChild(makePlayerList());
 
   const addRow = el('div', {class: 'add'});
   const inp = el('input', {type: 'text', placeholder: 'Add player', maxlength: 20});

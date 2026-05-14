@@ -1,4 +1,5 @@
 const STORAGE_KEY = "imposter-local-minimal-v1";
+const AI_KEY_STORAGE = "imposter-openai-key";
 
 const SECRET_BANK = {
   "Food & Drinks": [
@@ -157,7 +158,7 @@ const SECRET_BANK = {
   ]
 };
 
-const DEFAULT_PLAYERS = ["om", "aryan", "rohan", "thomas", "roger", "aaroh"];
+const DEFAULT_PLAYERS = [];
 const CATEGORIES = Object.keys(SECRET_BANK);
 
 const CASE_MOODS = [
@@ -189,7 +190,8 @@ const state = {
   ),
   settings: {
     imposterCount: Number.isInteger(saved.imposterCount) ? saved.imposterCount : 1,
-    hintMode: HINT_MODES[saved.hintMode] ? saved.hintMode : "imposter"
+    hintMode: HINT_MODES[saved.hintMode] ? saved.hintMode : "imposter",
+    wordSource: saved.wordSource === "bank" ? "bank" : "ai"
   },
   word: null,
   category: null,
@@ -199,7 +201,10 @@ const state = {
   mood: "",
   phase: "setup",
   turn: 0,
-  message: ""
+  message: "",
+  editingIdx: null,
+  loading: false,
+  apiKey: localStorage.getItem(AI_KEY_STORAGE) || ""
 };
 
 if (state.selectedCats.size === 0) {
@@ -227,10 +232,46 @@ function saveSettings() {
       players: state.players,
       selectedCats: Array.from(state.selectedCats),
       imposterCount: state.settings.imposterCount,
-      hintMode: state.settings.hintMode
+      hintMode: state.settings.hintMode,
+      wordSource: state.settings.wordSource
     })
   );
 }
+
+const _drag = { active: false, src: -1, over: -1, clone: null, listEl: null, offsetY: 0 };
+
+document.addEventListener("touchmove", (e) => {
+  if (!_drag.active) return;
+  e.preventDefault();
+  const t = e.touches[0];
+  if (_drag.clone) _drag.clone.style.top = (t.clientY - _drag.offsetY) + "px";
+  if (_drag.clone) _drag.clone.style.visibility = "hidden";
+  const under = document.elementFromPoint(t.clientX, t.clientY);
+  if (_drag.clone) _drag.clone.style.visibility = "";
+  if (_drag.listEl) _drag.listEl.querySelectorAll(".player-item").forEach((e) => e.classList.remove("drag-over"));
+  const item = under && under.closest(".player-item");
+  if (item && _drag.listEl && _drag.listEl.contains(item)) {
+    const idx = +item.dataset.idx;
+    if (idx !== _drag.src) { item.classList.add("drag-over"); _drag.over = idx; }
+    else _drag.over = _drag.src;
+  }
+}, { passive: false });
+
+function endTouchDrag() {
+  if (!_drag.active) return;
+  if (_drag.clone) { _drag.clone.remove(); _drag.clone = null; }
+  if (_drag.listEl) _drag.listEl.querySelectorAll(".player-item").forEach((e) => e.classList.remove("dragging", "drag-over"));
+  const { src, over } = _drag;
+  Object.assign(_drag, { active: false, src: -1, over: -1, listEl: null });
+  if (over !== -1 && over !== src) {
+    const moved = state.players.splice(src, 1)[0];
+    state.players.splice(over, 0, moved);
+    saveSettings();
+    render();
+  }
+}
+document.addEventListener("touchend", endTouchDrag);
+document.addEventListener("touchcancel", endTouchDrag);
 
 function pick(items) {
   return items[randomInt(items.length)];
@@ -246,7 +287,7 @@ function randomInt(max) {
   return Math.floor(Math.random() * max);
 }
 
-function startRound() {
+async function startRound() {
   normalizeSettings();
 
   if (state.players.length < 3) {
@@ -263,22 +304,112 @@ function startRound() {
 
   const categories = Array.from(state.selectedCats);
   state.category = pick(categories);
-  const secretCase = pick(SECRET_BANK[state.category]);
-  state.word = secretCase.secret;
-  state.hint = secretCase.hint;
   state.imposterIndexes = pickUniqueIndexes(state.players.length, state.settings.imposterCount);
   state.caseId = createCaseId();
   state.mood = pick(CASE_MOODS);
   state.turn = 0;
-  state.phase = "pass";
   state.message = "";
+
+  if (state.settings.wordSource === "ai" && state.apiKey) {
+    state.loading = true;
+    render();
+    try {
+      const result = await generateWithAI(state.category, state.apiKey);
+      state.word = result.secret;
+      state.hint = result.hint;
+    } catch {
+      const fallback = pick(SECRET_BANK[state.category]);
+      state.word = fallback.secret;
+      state.hint = fallback.hint;
+      state.message = "AI unavailable — used word bank instead.";
+    }
+    state.loading = false;
+  } else {
+    const secretCase = pick(SECRET_BANK[state.category]);
+    state.word = secretCase.secret;
+    state.hint = secretCase.hint;
+  }
+
+  state.phase = "pass";
   render();
+}
+
+async function generateWithAI(category, apiKey) {
+  const allExamples = [
+    { cat: "Food",     ex: '{"secret":"Pizza","hint":"Friday, argument, leftovers"}' },
+    { cat: "Food",     ex: '{"secret":"Ramen","hint":"midnight, warmth, slurp"}' },
+    { cat: "Food",     ex: '{"secret":"Tacos","hint":"Tuesday, messy, optional"}' },
+    { cat: "Place",    ex: '{"secret":"Airport","hint":"strangers, goodbye, delays"}' },
+    { cat: "Place",    ex: '{"secret":"Gym","hint":"resolution, mirror, excuses"}' },
+    { cat: "Place",    ex: '{"secret":"Library","hint":"whispering, overdue, escape"}' },
+    { cat: "Object",   ex: '{"secret":"Umbrella","hint":"forgotten, dripping, optimism"}' },
+    { cat: "Object",   ex: '{"secret":"Wallet","hint":"panic, ritual, emptied"}' },
+    { cat: "Activity", ex: '{"secret":"Camping","hint":"bugs, disconnected, regret"}' },
+    { cat: "Activity", ex: '{"secret":"Swimming","hint":"chlorine, laps, silence"}' },
+  ];
+  const shuffled = allExamples.sort(() => Math.random() - 0.5).slice(0, 4);
+  const exampleBlock = shuffled.map(e => `Category: ${e.cat} → ${e.ex}`).join("\n");
+
+  const prompt = `You are a game master for the party game "Imposter". Generate a NEW secret word and 3 hint words for the category: ${category}.
+
+SECRET WORD:
+- Must be a common everyday word any adult instantly knows (e.g. sunscreen, elevator, handshake)
+- Pick something DIFFERENT from the examples below — do not reuse them
+- No abstract, niche, or obscure words
+
+HINTS (the hard part):
+- 3 single words that are sneaky — they fit the secret but also fit many other things
+- A player who knows the secret should think "yes, that works" — but the imposter shouldn't be able to narrow it down easily
+- Forbidden: synonyms, physical descriptions, obvious associations (e.g. for "Coffee" do NOT say "caffeine", "hot", "mug", "morning", "beans")
+- Good hints feel slightly unexpected or emotional — they suggest a context or feeling, not a definition
+
+STYLE EXAMPLES (do not repeat these):
+${exampleBlock}
+
+Return ONLY this JSON, no markdown:
+{"secret":"word or phrase","hint":"word1, word2, word3"}`;
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 80,
+      temperature: 1.1
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error?.message || `HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  const raw = data.choices[0].message.content.trim().replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+  const parsed = JSON.parse(raw);
+  if (!parsed.secret || !parsed.hint) throw new Error("Unexpected AI response shape");
+  return parsed;
+}
+
+function renderLoading() {
+  const card = el("div", { class: "card" });
+  card.appendChild(el("div", { class: "progress" }, "Opening case file"));
+  card.appendChild(el("div", { class: "icon-circle" }, "AI"));
+  card.appendChild(el("div", { class: "name" }, "Generating…"));
+  card.appendChild(el("div", { class: "tip" }, "Picking a fresh word. Just a moment."));
+  return card;
 }
 
 function render() {
   root.replaceChildren();
 
-  if (state.phase === "setup") {
+  if (state.loading) {
+    root.appendChild(renderLoading());
+  } else if (state.phase === "setup") {
     root.appendChild(renderSetup());
   } else if (state.phase === "pass") {
     root.appendChild(renderPass());
@@ -291,6 +422,104 @@ function render() {
   }
 
   window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+}
+
+function saveEdit(idx, val) {
+  const v = val.trim().replace(/\s+/g, " ");
+  if (v && !state.players.some((p, i) => p === v && i !== idx)) {
+    state.players[idx] = v;
+    saveSettings();
+  }
+  state.editingIdx = null;
+  render();
+}
+
+function makePlayerList() {
+  const list = el("div", { class: "player-list" });
+  let deskSrc = -1;
+
+  state.players.forEach((player, i) => {
+    const item = el("div", { class: "player-item" });
+    item.dataset.idx = i;
+    item.setAttribute("draggable", "true");
+
+    const handle = el("span", { class: "drag-handle" }, "⠿");
+
+    let nameEl;
+    if (state.editingIdx === i) {
+      nameEl = document.createElement("input");
+      nameEl.className = "player-name-edit";
+      nameEl.type = "text";
+      nameEl.maxLength = 20;
+      nameEl.value = player;
+      nameEl.setAttribute("autocomplete", "off");
+      nameEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); saveEdit(i, nameEl.value); }
+        if (e.key === "Escape") { state.editingIdx = null; render(); }
+      });
+      nameEl.addEventListener("blur", () => saveEdit(i, nameEl.value));
+      setTimeout(() => { nameEl.focus(); nameEl.select(); }, 0);
+    } else {
+      nameEl = el("span", { class: "player-name" }, player);
+    }
+
+    const actions = el("div", { class: "player-actions" });
+    if (state.editingIdx !== i) {
+      const editBtn = el("button", { type: "button", class: "icon-btn", "aria-label": `Edit ${player}` }, "✎");
+      editBtn.addEventListener("click", (e) => { e.stopPropagation(); state.editingIdx = i; render(); });
+      actions.appendChild(editBtn);
+    }
+    actions.appendChild(el("button", {
+      type: "button", class: "icon-btn", "aria-label": `Remove ${player}`,
+      onclick: () => { state.players.splice(i, 1); state.editingIdx = null; state.message = ""; normalizeSettings(); saveSettings(); render(); }
+    }, "×"));
+
+    // Desktop drag
+    item.addEventListener("dragstart", (e) => {
+      deskSrc = i; e.dataTransfer.effectAllowed = "move";
+      setTimeout(() => item.classList.add("dragging"), 0);
+    });
+    item.addEventListener("dragend", () => {
+      deskSrc = -1;
+      list.querySelectorAll(".player-item").forEach((e) => e.classList.remove("dragging", "drag-over"));
+    });
+    item.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      if (deskSrc !== -1 && deskSrc !== i) item.classList.add("drag-over");
+    });
+    item.addEventListener("dragleave", () => item.classList.remove("drag-over"));
+    item.addEventListener("drop", (e) => {
+      e.preventDefault();
+      if (deskSrc !== -1 && deskSrc !== i) {
+        const moved = state.players.splice(deskSrc, 1)[0];
+        state.players.splice(i, 0, moved);
+        deskSrc = -1; saveSettings(); render();
+      }
+    });
+
+    // Touch drag — only from handle
+    handle.addEventListener("touchstart", (e) => {
+      _drag.active = true; _drag.src = i; _drag.over = i; _drag.listEl = list;
+      const rect = item.getBoundingClientRect();
+      _drag.offsetY = e.touches[0].clientY - rect.top;
+      const clone = item.cloneNode(true);
+      clone.style.cssText = "position:fixed;left:" + rect.left + "px;top:" + rect.top + "px;width:" + rect.width + "px;z-index:9999;pointer-events:none;opacity:0.9;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.7);";
+      document.body.appendChild(clone);
+      _drag.clone = clone;
+      item.classList.add("dragging");
+    }, { passive: true });
+
+    item.appendChild(handle);
+    item.appendChild(nameEl);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+
+  if (!state.players.length) {
+    list.appendChild(el("span", { class: "empty-note" }, "No suspects yet."));
+  }
+
+  return list;
 }
 
 function renderSetup() {
@@ -317,35 +546,7 @@ function renderSetup() {
   wrap.appendChild(renderRulesPanel());
 
   wrap.appendChild(el("div", { class: "section" }, `Suspects (${state.players.length})`));
-
-  const playersDiv = el("div", { class: "players" });
-  state.players.forEach((player, index) => {
-    const tag = el("div", { class: "tag" }, el("span", null, player));
-    tag.appendChild(
-      el(
-        "button",
-        {
-          type: "button",
-          "aria-label": `Remove ${player}`,
-          onclick: () => {
-            state.players.splice(index, 1);
-            state.message = "";
-            normalizeSettings();
-            saveSettings();
-            render();
-          }
-        },
-        "x"
-      )
-    );
-    playersDiv.appendChild(tag);
-  });
-
-  if (!state.players.length) {
-    playersDiv.appendChild(el("span", { class: "empty-note" }, "No players yet."));
-  }
-
-  wrap.appendChild(playersDiv);
+  wrap.appendChild(makePlayerList());
 
   const addRow = el("form", { class: "add" });
   const input = el("input", {
@@ -393,6 +594,24 @@ function renderSetup() {
     );
   });
   wrap.appendChild(catsDiv);
+
+  if (state.settings.wordSource === "ai") {
+    wrap.appendChild(el("div", { class: "section" }, "OpenAI API key"));
+    const keyRow = el("form", { class: "add", style: "margin-bottom:12px" });
+    const keyInput = el("input", { type: "password", placeholder: "sk-…", maxlength: "200", autocomplete: "off", "aria-label": "OpenAI API key" });
+    keyInput.value = state.apiKey;
+    keyInput.addEventListener("input", () => {
+      state.apiKey = keyInput.value.trim();
+      localStorage.setItem(AI_KEY_STORAGE, state.apiKey);
+    });
+    keyRow.appendChild(keyInput);
+    keyRow.addEventListener("submit", (e) => e.preventDefault());
+    wrap.appendChild(keyRow);
+    const keyNote = state.apiKey
+      ? el("p", { class: "rule-detail", style: "margin-bottom:20px" }, "Key saved. AI will generate a fresh word each round.")
+      : el("p", { class: "rule-detail", style: "margin-bottom:20px" }, "No key — word bank will be used as fallback. Get a key at platform.openai.com.");
+    wrap.appendChild(keyNote);
+  }
 
   if (state.message) {
     wrap.appendChild(el("p", { class: "tip" }, state.message));
@@ -476,9 +695,22 @@ function renderRulesPanel() {
     );
   });
 
+  const sourceGroup = el("div", { class: "choice-group" }, el("p", null, "Word source"), el("div", { class: "choice-row stacked" }));
+  const sourceChoices = sourceGroup.querySelector(".choice-row");
+  [{ value: "ai", label: "AI generated" }, { value: "bank", label: "Word bank" }].forEach(({ value, label }) => {
+    const selected = state.settings.wordSource === value;
+    sourceChoices.appendChild(el("button", {
+      type: "button",
+      class: selected ? "choice text-choice on" : "choice text-choice",
+      "aria-pressed": selected ? "true" : "false",
+      onclick: () => { state.settings.wordSource = value; state.message = ""; saveSettings(); render(); }
+    }, label));
+  });
+
   panel.append(
     imposterGroup,
     hintGroup,
+    sourceGroup,
     el("p", { class: "rule-detail" }, HINT_MODES[state.settings.hintMode].detail)
   );
   return panel;
